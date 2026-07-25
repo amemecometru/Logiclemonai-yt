@@ -3,31 +3,23 @@ import time
 import json
 import os
 import uuid
+import re
+import httpx
+from urllib.parse import quote
 from typing import Dict, Any, Optional, List
-from datetime import datetime, timedelta
-from app.agents.research_agent import ResearchAgent
-from app.agents.script_writer_agent import ScriptWriterAgent
-from app.agents.youtube_seo_agent import YouTubeSEOAgent
-from app.agents.thumbnail_agent import ThumbnailAgent
-from app.models.content import ContentRequest, ContentStatus
-from app.models.youtube import VideoScript, YouTubeMetadata, ThumbnailDesign, ContentPlan
-from app.config import settings
+
+from app.services.cf_ai_service import run_cf_ai
+from app.models.content import ContentStatus
 from app.services.database_service import DatabaseService
 
 
 class YTPipeline:
     def __init__(self):
-        self.research_agent = ResearchAgent()
-        self.script_agent = ScriptWriterAgent()
-        self.seo_agent = YouTubeSEOAgent()
-        self.thumbnail_agent = ThumbnailAgent()
         self.active_tasks: Dict[str, Dict[str, Any]] = {}
-        self.content_plan: Optional[ContentPlan] = None
         self.db = DatabaseService()
 
     def register_task(self) -> str:
-        """Create a task entry up front (status=processing) and return its id, so a
-        non-blocking endpoint can return immediately while the pipeline runs in the background."""
+        """Create a task entry up front (status=processing) and return its id."""
         task_id = f"yt_{uuid.uuid4().hex[:12]}"
         self.active_tasks[task_id] = {
             "status": ContentStatus.PROCESSING,
@@ -38,11 +30,14 @@ class YTPipeline:
         self._evict_old_tasks()
         return task_id
 
-    async def create_video_content(self, topic: str, target_audience: str = "general audience",
-                                    video_length: str = "medium", tone: str = "professional",
-                                    niche: str = "general", channel_config: Optional[Dict[str, Any]] = None,
-                                    task_id: Optional[str] = None, export_md: bool = False,
-                                    model: Optional[str] = None, byok_key: Optional[str] = None) -> Dict[str, Any]:
+    async def run_full_studio_pipeline(
+        self, 
+        topic: str, 
+        product_details: str = "", 
+        task_id: Optional[str] = None,
+        image_tier: str = "standard"
+    ) -> Dict[str, Any]:
+        """Consolidated 2-pass studio pipeline: Single-pass LLM + Parallel Image Engine."""
         if task_id is None:
             task_id = self.register_task()
         elif task_id not in self.active_tasks:
@@ -54,83 +49,75 @@ class YTPipeline:
             }
 
         try:
-            self.active_tasks[task_id]["current_agent"] = "research"
-            self.active_tasks[task_id]["progress"] = 5
-            research_result = await self.research_agent.execute({
-                "topic": topic,
-                "max_results": 10,
-                "search_depth": "advanced",
-                "model": model,
-                "byok_key": byok_key,
-            })
+            # STEP 1: SINGLE-PASS AI GENERATION
+            self.active_tasks[task_id]["current_agent"] = "ai_studio"
+            self.active_tasks[task_id]["progress"] = 20
 
-            if research_result["status"] != "success":
-                return self._error_response(task_id, "Research failed", research_result.get("message", ""))
+            script_prompt = f"""Create a complete YouTube Script, a 4-post X (Twitter) thread, and 4 16:9 cinematic visual scene prompts for topic: '{topic}'. Context/Product: '{product_details}'.
 
-            research_data = research_result.get("research_data", {})
-            confidence = research_result.get("confidence_score", 0.5)
-            self.active_tasks[task_id]["progress"] = 25
+Return strictly valid JSON with this exact schema:
+{{
+  "script": {{
+    "title": "Catchy Video Title",
+    "description": "Engaging description with hashtags",
+    "tags": "tag1, tag2, tag3",
+    "intro": "Hook and introduction...",
+    "body": "Main content body...",
+    "outro": "Outro and CTA..."
+  }},
+  "x_thread": ["Post 1...", "Post 2...", "Post 3...", "Post 4..."],
+  "visual_prompts": ["Prompt 1...", "Prompt 2...", "Prompt 3...", "Prompt 4..."]
+}}"""
 
-            self.active_tasks[task_id]["current_agent"] = "script_writer"
-            self.active_tasks[task_id]["progress"] = 30
-            script_result = await self.script_agent.execute({
-                "topic": topic,
-                "research_data": research_data,
-                "target_audience": target_audience,
-                "video_length": video_length,
-                "tone": tone,
-                "model": model,
-                "byok_key": byok_key,
-            })
-
-            if script_result["status"] != "success":
-                return self._error_response(task_id, "Script writing failed", script_result.get("message", ""))
-
-            script = script_result.get("script", {})
-            self.active_tasks[task_id]["progress"] = 55
-
-            self.active_tasks[task_id]["current_agent"] = "seo + thumbnail"
+            text_response = await run_cf_ai(script_prompt)
+            clean_json = text_response.strip()
+            if clean_json.startswith("```json"):
+                clean_json = clean_json[7:]
+            if clean_json.endswith("```"):
+                clean_json = clean_json[:-3]
+            
+            content = json.loads(clean_json.strip())
             self.active_tasks[task_id]["progress"] = 60
 
-            seo_coro = self.seo_agent.execute({
-                "topic": topic, "script": script, "research_data": research_data,
-                "target_audience": target_audience, "channel_config": channel_config or {},
-                "model": model, "byok_key": byok_key,
-            })
-            thumb_coro = self.thumbnail_agent.execute({
-                "topic": topic, "title": script.get("title", topic), "script": script,
-                "research_data": research_data, "niche": niche,
-                "model": model, "byok_key": byok_key,
-            })
-            seo_result, thumbnail_result = await asyncio.gather(seo_coro, thumb_coro)
+            # STEP 2: PARALLEL IMAGE GENERATION
+            self.active_tasks[task_id]["current_agent"] = f"renderer_{image_tier}"
+            prompts = content.get("visual_prompts", [])
+            
+            if not prompts:
+                prompts = [f"Hyper-realistic 8k 16:9 scene for: {p}" for p in content.get("x_thread", [])[:4]]
 
-            if seo_result["status"] != "success":
-                return self._error_response(task_id, "SEO optimization failed", seo_result.get("message", ""))
+            async def render_single_image(idx: int, prompt_text: str) -> Dict[str, Any]:
+                encoded = quote(prompt_text)
+                if image_tier == "ultra":
+                    img_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1920&height=1080&model=flux&nologo=true&enhance=true"
+                else:
+                    img_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1280&height=720&nologo=true"
+                
+                return {
+                    "scene_number": idx + 1,
+                    "action": f"Scene {idx + 1}",
+                    "prompt": prompt_text,
+                    "image_url": img_url,
+                    "tier": image_tier
+                }
 
-            metadata = seo_result.get("metadata", {})
-            title_variants = seo_result.get("title_variants", [])
-            thumbnail = thumbnail_result.get("thumbnail", {}) if thumbnail_result["status"] == "success" else None
-            self.active_tasks[task_id]["progress"] = 95
+            render_tasks = [render_single_image(i, p) for i, p in enumerate(prompts[:4])]
+            rendered_images = await asyncio.gather(*render_tasks)
 
+            self.active_tasks[task_id]["progress"] = 90
+
+            # STEP 3: PACKAGE FINAL PAYLOAD
             execution_time = time.time() - self.active_tasks[task_id]["start_time"]
-
             result = {
                 "task_id": task_id,
                 "status": "success",
                 "topic": topic,
-                "niche": niche,
-                "target_audience": target_audience,
+                "image_tier": image_tier,
                 "execution_time": round(execution_time, 2),
-                "research_confidence": round(confidence, 2),
-                "script": script,
-                "metadata": metadata,
-                "title_variants": title_variants,
-                "thumbnail_design": thumbnail,
-                "research_data": {
-                    "key_findings": research_data.get("key_findings", [])[:5],
-                    "source_count": len(research_data.get("sources", [])),
-                    "confidence": confidence
-                }
+                "script": content.get("script", {}),
+                "x_thread": content.get("x_thread", []),
+                "thumbnail_url": rendered_images[0]["image_url"] if rendered_images else "",
+                "x_visual_pack": rendered_images
             }
 
             self.active_tasks[task_id]["status"] = ContentStatus.COMPLETED
@@ -139,110 +126,13 @@ class YTPipeline:
             await self._persist_result(task_id, result)
             self._evict_old_tasks()
 
-            if export_md:
-                try:
-                    md_path = await self._export_markdown(result)
-                    result["markdown_path"] = md_path
-                except Exception as md_err:
-                    print(f"[MD export failed] {md_err}")
-                    result["markdown_path"] = None
-
             return result
 
         except Exception as e:
-            return self._error_response(task_id, "Pipeline execution failed", str(e))
-
-    async def create_batch(self, topics: List[str], target_audience: str = "general audience",
-                            video_length: str = "medium", tone: str = "professional",
-                            niche: str = "general",
-                            model: Optional[str] = None, byok_key: Optional[str] = None) -> List[Dict[str, Any]]:
-        results = []
-        for topic in topics:
-            print(f"\nCreating video content for: {topic}")
-            result = await self.create_video_content(
-                topic=topic,
-                target_audience=target_audience,
-                video_length=video_length,
-                tone=tone,
-                niche=niche,
-                model=model,
-                byok_key=byok_key,
-            )
-            results.append(result)
-            if result["status"] != "success":
-                print(f"Failed: {result.get('message', '')}")
-        return results
-
-    async def generate_content_plan(self, niche: str, month: str, num_videos: int = 8,
-                                     target_audience: str = "general audience") -> Dict[str, Any]:
-        prompt = f"""Create a YouTube content plan for a channel about "{niche}".
-
-Generate {num_videos} video topics for {month}.
-
-For each video provide:
-1. Video title
-2. Target keywords
-3. Why it will perform well
-4. Suggested video length
-
-Return as JSON array:
-[
-  {{
-    "title": "Video title",
-    "keywords": ["keyword1", "keyword2"],
-    "rationale": "Why this topic works",
-    "suggested_length": "medium",
-    "tone": "professional"
-  }}
-]
-
-Return ONLY valid JSON."""
-
-        from app.config import get_agent_config
-        agent_cfg = get_agent_config()
-
-        try:
-            import openai
-            client_kwargs = {"api_key": agent_cfg["openai_api_key"]}
-            if agent_cfg.get("base_url"):
-                client_kwargs["base_url"] = agent_cfg["base_url"]
-            if agent_cfg.get("default_headers"):
-                client_kwargs["default_headers"] = agent_cfg["default_headers"]
-            client = openai.AsyncOpenAI(**client_kwargs)
-            response = await client.chat.completions.create(
-                model=agent_cfg["model"],
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=2000,
-                temperature=0.8
-            )
-            content = response.choices[0].message.content.strip()
-            if content.startswith("```json"):
-                content = content[7:]
-            if content.endswith("```"):
-                content = content[:-3]
-            video_plan = json.loads(content.strip())
-        except Exception as e:
-            print(f"Failed to generate content plan via AI: {e}")
-            video_plan = [{"title": f"Video {i+1} about {niche}", "keywords": [niche],
-                           "rationale": f"Educational content about {niche}", "suggested_length": "medium", "tone": "professional"}
-                          for i in range(num_videos)]
-
-        plan = ContentPlan(
-            channel_name=niche.replace(" ", "_").lower(),
-            niche=niche,
-            month=month,
-            week=1,
-            videos=video_plan
-        )
-
-        return {
-            "status": "success",
-            "plan": plan.model_dump()
-        }
+            return self._error_response(task_id, "Full Studio Pipeline failed", str(e))
 
     async def get_task_status(self, task_id: str) -> Dict[str, Any]:
         if task_id not in self.active_tasks:
-            # Fall back to the persisted store so status/result survive a restart.
             persisted = await self.db.get_yt_video(task_id)
             if persisted:
                 return {
@@ -267,8 +157,6 @@ Return ONLY valid JSON."""
         return status
 
     def _evict_old_tasks(self, max_tasks: int = 200):
-        """Bound in-memory task growth — drop the oldest once over the cap.
-        Completed results are persisted to D1, so eviction only drops the in-memory copy."""
         if len(self.active_tasks) <= max_tasks:
             return
         oldest = sorted(self.active_tasks, key=lambda k: self.active_tasks[k].get("start_time", 0))
@@ -276,7 +164,6 @@ Return ONLY valid JSON."""
             self.active_tasks.pop(tid, None)
 
     async def _persist_result(self, task_id: str, result: Dict[str, Any]):
-        """Best-effort save of a completed result to D1 (no-op if Cloudflare DB is unconfigured)."""
         try:
             script = result.get("script", {}) or {}
             await self.db.save_yt_video({
@@ -284,92 +171,11 @@ Return ONLY valid JSON."""
                 "topic": result.get("topic"),
                 "title": script.get("title") or result.get("topic"),
                 "status": "completed",
-                "niche": result.get("niche"),
-                "target_audience": result.get("target_audience"),
                 "result": result,
                 "execution_time": result.get("execution_time", 0),
             })
         except Exception as e:
             print(f"[YT] persist failed for {task_id}: {e}")
-
-    async def _export_markdown(self, result: Dict[str, Any]) -> str:
-        import os, re
-        script = result.get("script") or {}
-        if not isinstance(script, dict):
-            script = {}
-        meta = result.get("metadata") or {}
-        if not isinstance(meta, dict):
-            meta = {}
-        thumb = result.get("thumbnail_design") or {}
-        if not isinstance(thumb, dict):
-            thumb = {}
-        topic = result.get("topic", "video")
-        title = (script.get("title") if isinstance(script, dict) else None) or topic
-
-        lines = [
-            f"# {title}",
-            "",
-            f"**Topic:** {topic}",
-            f"**Niche:** {result.get('niche', 'general')}",
-            f"**Audience:** {result.get('target_audience', 'general')}",
-            f"**Execution time:** {result.get('execution_time', 0):.1f}s",
-            "",
-        ]
-
-        if isinstance(meta, dict) and meta.get("description"):
-            lines += ["## Description", "", meta["description"], ""]
-
-        if isinstance(meta, dict) and meta.get("tags"):
-            lines += ["## Tags", "", ", ".join(meta["tags"]), ""]
-
-        variants = result.get("title_variants", [])
-        if isinstance(variants, list) and variants:
-            lines += ["## Title Variants", ""]
-            for v in variants:
-                headline = v.get("title", "") if isinstance(v, dict) else str(v)
-                score = v.get("appeal_score", "N/A") if isinstance(v, dict) else "N/A"
-                lines += [f"- {headline} (appeal: {score})"]
-            lines += [""]
-
-        sections = script.get("sections", []) if isinstance(script, dict) and isinstance(script.get("sections"), list) else []
-        if sections:
-            lines += ["## Script", ""]
-            for s in sections:
-                lines += [f"### {s.get('heading', 'Section')}", "", s.get("content", ""), ""]
-
-        if isinstance(script, dict):
-            if script.get("hook"):
-                lines += ["## Hook", "", script["hook"], ""]
-            if script.get("conclusion"):
-                lines += ["## Conclusion", "", script["conclusion"], ""]
-            if script.get("cta"):
-                lines += ["## Call to Action", "", script["cta"], ""]
-
-        if isinstance(thumb, dict) and thumb.get("concept_description"):
-            lines += ["## Thumbnail Design", ""]
-            lines += [f"- **Concept:** {thumb['concept_description']}"]
-            lines += [f"- **Composition:** {thumb.get('composition_guide', '')}"]
-            lines += [f"- **Text overlay:** {thumb.get('text_overlay', '')}"]
-            lines += [f"- **Color scheme:** {', '.join(thumb.get('color_scheme', []))}"]
-            if thumb.get("thumbnail_url"):
-                lines += [f"- **Image:** {thumb['thumbnail_url']}"]
-            lines += [""]
-
-        out_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "output")
-        os.makedirs(out_dir, exist_ok=True)
-        safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', title.strip())[:60]
-        md_path = os.path.join(out_dir, f"{safe_name}.md")
-
-        with open(md_path, "w") as f:
-            f.write("\n".join(lines))
-
-        return md_path
-
-    async def cancel_task(self, task_id: str) -> Dict[str, Any]:
-        if task_id not in self.active_tasks:
-            return {"error": "Task not found"}
-        self.active_tasks[task_id]["status"] = ContentStatus.FAILED
-        return {"task_id": task_id, "status": "cancelled"}
 
     def _error_response(self, task_id: str, error_type: str, message: str) -> Dict[str, Any]:
         resp = {
@@ -380,5 +186,5 @@ Return ONLY valid JSON."""
         }
         if task_id in self.active_tasks:
             self.active_tasks[task_id]["status"] = ContentStatus.FAILED
-            self.active_tasks[task_id]["result"] = resp   # so pollers can surface the failure
+            self.active_tasks[task_id]["result"] = resp
         return resp
